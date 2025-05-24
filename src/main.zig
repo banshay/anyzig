@@ -164,10 +164,10 @@ fn determineSemanticVersion(scratch: Allocator, build_root: BuildRoot) !Semantic
             "expected the .mach_zig_version value to end with '-mach' but got '{s}'",
             .{version},
         );
-        log.info(
-            "zig mach version '{s}' pulled from '{}build.zig.zon'",
-            .{ version, build_root.directory },
-        );
+        // log.info(
+        //     "zig mach version '{s}' pulled from '{}build.zig.zon'",
+        //     .{ version, build_root.directory },
+        // );
         return SemanticVersion.parse(version) orelse errExit(
             "{}build.zig.zon has invalid .mach_zig_version \"{s}\"",
             .{ build_root.directory, version },
@@ -179,10 +179,10 @@ fn determineSemanticVersion(scratch: Allocator, build_root: BuildRoot) !Semantic
         .{@tagName(build_options.exe)},
     );
     const minimum_zig_version = zon[version_extent.start..version_extent.limit];
-    log.info(
-        "zig version '{s}' pulled from '{}build.zig.zon'",
-        .{ minimum_zig_version, build_root.directory },
-    );
+    // log.debug(
+    //     "zig version '{s}' pulled from '{}build.zig.zon'",
+    //     .{ minimum_zig_version, build_root.directory },
+    // );
     return SemanticVersion.parse(minimum_zig_version) orelse errExit(
         "{}build.zig.zon has invalid .minimum_zig_version \"{s}\"",
         .{ build_root.directory, minimum_zig_version },
@@ -277,7 +277,7 @@ pub fn main() !void {
 
     const app_data_path = try std.fs.getAppDataDir(arena, "anyzig");
     defer arena.free(app_data_path);
-    log.info("appdata '{s}'", .{app_data_path});
+    // log.debug("appdata '{s}'", .{app_data_path});
 
     const semantic_version = semantic_version: switch (version_specifier) {
         .semantic => |v| v,
@@ -322,10 +322,10 @@ pub fn main() !void {
     const hash = blk: {
         if (maybe_hash) |hash| {
             if (global_cache_directory.handle.access(hash.path(), .{})) |_| {
-                log.info(
-                    "{s} '{}' already exists at '{}{s}'",
-                    .{ @tagName(build_options.exe), semantic_version, global_cache_directory, hash.path() },
-                );
+                // log.debug(
+                //     "{s} '{}' already exists at '{}{s}'",
+                //     .{ @tagName(build_options.exe), semantic_version, global_cache_directory, hash.path() },
+                // );
                 break :blk hash;
             } else |err| switch (err) {
                 error.FileNotFound => {},
@@ -566,6 +566,7 @@ const DownloadIndexKind = enum {
 };
 
 const DownloadUrl = struct {
+    version: ?[]const u8 = null,
     // use to know if two URL's are the same
     official: []const u8,
     // the actual URL to fetch from
@@ -602,11 +603,13 @@ fn getVersionUrl(
     semantic_version: SemanticVersion,
     arch_os: []const u8,
 ) !DownloadUrl {
-    if (build_options.exe == .zls) return DownloadUrl.initOfficial(std.fmt.allocPrint(
-        arena,
-        "https://builds.zigtools.org/zls-{s}-{}.{s}",
-        .{ url_platform, semantic_version, archive_ext },
-    ) catch |e| oom(e));
+    if (build_options.exe == .zls and
+        !isMachVersion(semantic_version))
+        return DownloadUrl.initOfficial(std.fmt.allocPrint(
+            arena,
+            "https://builds.zigtools.org/zls-{s}-{}.{s}",
+            .{ url_platform, semantic_version, archive_ext },
+        ) catch |e| oom(e));
 
     if (!isMachVersion(semantic_version)) return makeOfficialUrl(arena, semantic_version);
 
@@ -624,8 +627,12 @@ fn getVersionUrl(
             break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
         };
         defer arena.free(index_content);
-        if (extractUrlFromMachDownloadIndex(arena, semantic_version, arch_os, index_path, index_content)) |url|
+        if (extractUrlFromMachDownloadIndex(arena, semantic_version, arch_os, index_path, index_content)) |url| {
+            if (build_options.exe == .zls) {
+                return doZls(arena, app_data_path, url.version.?, arch_os);
+            }
             return url;
+        }
     }
 
     try downloadFile(arena, download_index_kind.url(), index_path);
@@ -636,9 +643,78 @@ fn getVersionUrl(
         break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
     };
     defer arena.free(index_content);
-    return extractUrlFromMachDownloadIndex(arena, semantic_version, arch_os, index_path, index_content) orelse {
+    const url = extractUrlFromMachDownloadIndex(arena, semantic_version, arch_os, index_path, index_content) orelse {
         errExit("compiler version '{}' is missing from download index {s}", .{ semantic_version, index_path });
     };
+
+    if (build_options.exe == .zls) {
+        return doZls(arena, app_data_path, url.version.?, arch_os);
+    }
+
+    return url;
+}
+
+fn doZls(arena: Allocator, app_data_path: []const u8, version: []const u8, arch_os: []const u8) !DownloadUrl {
+    const index_path = try std.fs.path.join(arena, &.{ app_data_path, "zls_index" });
+
+    try_existing_index: {
+        const index_content = blk: {
+            const file = std.fs.cwd().openFile(index_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :try_existing_index,
+                else => |e| return e,
+            };
+            defer file.close();
+            break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
+        };
+        defer arena.free(index_content);
+
+        if (extractFromZlsIndex(arena, version, arch_os, index_path, index_content)) |url|
+            return url;
+    }
+
+    var v = std.ArrayList(u8).init(arena);
+    defer v.deinit();
+    const isValidChar = struct {
+        fn func(char: u8) bool {
+            return switch (char) {
+                '+' => false,
+                else => true,
+            };
+        }
+    }.func;
+    try std.Uri.Component.percentEncode(v.writer(), version, isValidChar);
+    const url = try std.fmt.allocPrint(arena, "https://releases.zigtools.org/v1/zls/select-version?zig_version={s}&compatibility=full", .{try v.toOwnedSlice()});
+    try downloadFile(arena, url, index_path);
+
+    const index_content = blk: {
+        // since we just downloaded the file, this should always succeed now
+        const file = try std.fs.cwd().openFile(index_path, .{});
+        defer file.close();
+        break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
+    };
+    defer arena.free(index_content);
+    return extractFromZlsIndex(arena, version, arch_os, index_path, index_content) orelse {
+        errExit("compiler version '{?s}' is missing from download index {s}", .{ version, index_path });
+    };
+}
+
+fn extractFromZlsIndex(allocator: Allocator, semantic_version: []const u8, arch_os: []const u8, index_path: []const u8, index_content: []const u8) ?DownloadUrl {
+    const root = std.json.parseFromSlice(std.json.Value, allocator, index_content, .{
+        .allocate = .alloc_if_needed,
+    }) catch |e| std.debug.panic(
+        "failed to parse download index '{s}' as JSON with {s}",
+        .{ index_path, @errorName(e) },
+    );
+    defer root.deinit();
+    const arch_os_obj = root.value.object.get(arch_os) orelse std.debug.panic(
+        "zls version '{s}' does not contain an entry for arch-os '{s}'",
+        .{ semantic_version, arch_os },
+    );
+    const fetch_url = arch_os_obj.object.get("tarball") orelse std.debug.panic(
+        "download index '{s}' version '{s}' arch-os '{s}' is missing the 'tarball' property",
+        .{ index_path, semantic_version, arch_os },
+    );
+    return DownloadUrl.initOfficial(fetch_url.string);
 }
 
 fn extractMasterVersion(
@@ -696,6 +772,7 @@ fn extractUrlFromMachDownloadIndex(
         .{ index_filepath, version_str, arch_os },
     );
     return .{
+        .version = allocator.dupe(u8, (version_obj.object.get("version") orelse unreachable).string) catch |e| oom(e),
         .fetch = allocator.dupe(u8, fetch_url.string) catch |e| oom(e),
         .official = allocator.dupe(u8, official_url.string) catch |e| oom(e),
     };
